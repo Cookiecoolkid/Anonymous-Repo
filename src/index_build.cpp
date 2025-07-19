@@ -10,6 +10,8 @@
 #include <chrono>
 #include <iomanip>
 #include <omp.h>
+#include <atomic>
+#include <thread>      // 用于 sleep
 
 namespace CNNS {
 
@@ -198,7 +200,7 @@ bool IndexBuilder<T>::build(const std::string& data_file, DataFormat format, boo
         std::cerr << "Failed to build NNDescent graph" << std::endl;
         return false;
     }
-
+    
     auto nndescent_end = std::chrono::high_resolution_clock::now();
     auto nndescent_duration = std::chrono::duration_cast<std::chrono::milliseconds>(nndescent_end - nndescent_start);
     double nndescent_time_ms = nndescent_duration.count();
@@ -280,21 +282,47 @@ bool IndexBuilder<T>::buildClusterData(const std::vector<T>& data,
                                      const std::map<faiss::idx_t, std::vector<faiss::idx_t>>& cluster_to_ids,
                                      unsigned dim) {
     try {
-        for (const auto& [cluster_id, ids_in_cluster] : cluster_to_ids) {
+        // 准备cluster_ids向量用于并行处理
+        std::vector<faiss::idx_t> cluster_ids;
+        for (const auto& [cluster_id, _] : cluster_to_ids) {
+            cluster_ids.push_back(cluster_id);
+        }
+        
+        // 并行写入cluster数据
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < static_cast<int>(cluster_ids.size()); ++i) {
+            auto cluster_id = cluster_ids[i];
+            const auto& ids_in_cluster = cluster_to_ids.at(cluster_id);
+            
             std::string cluster_file = prefix_ + "/cluster_data/cluster_" + std::to_string(cluster_id) + ".data";
-            std::ofstream out(cluster_file, std::ios::binary);
-            if (!out.is_open()) {
-                std::cerr << "Cannot open cluster file " << cluster_file << std::endl;
-                return false;
-            }
+            
+            // 使用临时文件避免并发写入冲突
+            std::string temp_file = cluster_file + ".tmp";
+            {
+                std::ofstream out(temp_file, std::ios::binary);
+                if (!out.is_open()) {
+                    #pragma omp critical
+                    {
+                        std::cerr << "Cannot open temp cluster file " << temp_file << std::endl;
+                    }
+                    continue;
+                }
 
-            // 写入每个向量的维度
-            // out.write((char*)&dim, sizeof(dim));
-            for (faiss::idx_t id : ids_in_cluster) {
-                // out.write((char*)&dim, sizeof(dim));
-                out.write((char*)(data.data() + id * dim), dim * sizeof(T));
+                // 写入每个向量的数据
+                for (faiss::idx_t id : ids_in_cluster) {
+                    out.write((char*)(data.data() + id * dim), dim * sizeof(T));
+                }
+                out.close();
             }
-            out.close();
+            
+            // 原子性地重命名文件
+            #pragma omp critical
+            {
+                if (std::filesystem::exists(cluster_file)) {
+                    std::filesystem::remove(cluster_file);
+                }
+                std::filesystem::rename(temp_file, cluster_file);
+            }
         }
         return true;
     } catch (const std::exception& e) {
@@ -436,19 +464,47 @@ bool IndexBuilder<T>::buildClusterMappings(const std::map<faiss::idx_t, std::vec
 
 template<typename T>
 bool IndexBuilder<T>::buildNNDescentGraph(const std::map<faiss::idx_t, std::vector<faiss::idx_t>>& cluster_to_ids,
-                            unsigned dim) {
+                                          unsigned dim) {
     try {
-        for (const auto& [cluster_id, ids_in_cluster] : cluster_to_ids) {
-            // 创建并加载聚类数据
+        std::vector<std::pair<faiss::idx_t, std::vector<faiss::idx_t>>> cluster_vec(
+            cluster_to_ids.begin(), cluster_to_ids.end()
+        );
+
+        // 🎯 优化：减少并发数量，避免IO拥塞和内存压力
+        const int max_parallel_clusters = 4;  // 从8减少到4，减少IO压力
+        std::atomic<int> running_clusters(0);
+
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < static_cast<int>(cluster_vec.size()); ++i) {
+            while (running_clusters.load() >= max_parallel_clusters) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            running_clusters.fetch_add(1);
+
+            const auto& [cluster_id, ids_in_cluster] = cluster_vec[i];
+
+            #pragma omp critical
+            std::cout << "[NNDescent] Building graph for cluster " << cluster_id 
+                      << " with " << ids_in_cluster.size() << " points" << std::endl;
+
             CNNS::ClusterMMap cluster_data;
             if (!load_cluster_data_mmap(cluster_id, dim, cluster_data, prefix_)) {
+                #pragma omp critical
                 std::cerr << "Failed to load cluster data for cluster " << cluster_id << std::endl;
-                return false;
+                running_clusters.fetch_sub(1);
+                continue;
             }
 
-            // 构建NNDescent图
+            if (!cluster_data.data_ptr) {
+                #pragma omp critical
+                std::cerr << "Invalid data pointer for cluster " << cluster_id << std::endl;
+                running_clusters.fetch_sub(1);
+                continue;
+            }
+
             efanna2e::IndexRandom init_index(dim, ids_in_cluster.size());
             efanna2e::IndexGraph index(dim, ids_in_cluster.size(), efanna2e::L2, &init_index);
+
             efanna2e::Parameters paras;
             paras.Set<unsigned>("K", k_nndescent_);
             paras.Set<unsigned>("L", l_nndescent_);
@@ -456,15 +512,31 @@ bool IndexBuilder<T>::buildNNDescentGraph(const std::map<faiss::idx_t, std::vect
             paras.Set<unsigned>("S", s_);
             paras.Set<unsigned>("R", r_);
 
-            index.Build(ids_in_cluster.size(), cluster_data.data_ptr, paras);
-
-            // 保存NNDescent图
-            if (!saveNNDescentGraph(index, cluster_id)) {
-                std::cerr << "Failed to save NNDescent graph for cluster " << cluster_id << std::endl;
-                return false;
+            try {
+                index.Build(ids_in_cluster.size(), cluster_data.data_ptr, paras);
+            } catch (const std::exception& e) {
+                #pragma omp critical
+                std::cerr << "Error during NNDescent build for cluster " << cluster_id 
+                          << ": " << e.what() << std::endl;
+                running_clusters.fetch_sub(1);
+                continue;
             }
+
+            if (!saveNNDescentGraph(index, cluster_id)) {
+                #pragma omp critical
+                std::cerr << "Failed to save NNDescent graph for cluster " << cluster_id << std::endl;
+                running_clusters.fetch_sub(1);
+                continue;
+            }
+
+            #pragma omp critical
+            std::cout << "[NNDescent] Done with cluster " << cluster_id << std::endl;
+
+            running_clusters.fetch_sub(1);
         }
+
         return true;
+
     } catch (const std::exception& e) {
         std::cerr << "Error building NNDescent graph: " << e.what() << std::endl;
         return false;
@@ -491,10 +563,19 @@ bool IndexBuilder<T>::buildNSGGraph(const std::map<faiss::idx_t, std::vector<fai
                                   bool use_mmap) {
     try {
         for (const auto& [cluster_id, ids_in_cluster] : cluster_to_ids) {
+            std::cout << "Building NSG graph for cluster " << cluster_id 
+                      << " with " << ids_in_cluster.size() << " points" << std::endl;
+            
             // 创建并加载聚类数据
             CNNS::ClusterMMap cluster_data;
             if (!load_cluster_data_mmap(cluster_id, dim, cluster_data, prefix_)) {
                 std::cerr << "Failed to load cluster data for cluster " << cluster_id << std::endl;
+                return false;
+            }
+
+            // 验证数据指针
+            if (!cluster_data.data_ptr) {
+                std::cerr << "Invalid data pointer for cluster " << cluster_id << std::endl;
                 return false;
             }
             
@@ -507,13 +588,21 @@ bool IndexBuilder<T>::buildNSGGraph(const std::map<faiss::idx_t, std::vector<fai
             paras.Set<std::string>("nn_graph_path", 
                 prefix_ + "/nndescent/nndescent_" + std::to_string(cluster_id) + ".graph");
 
-            index.Build(ids_in_cluster.size(), cluster_data.data_ptr, paras);
+            try {
+                index.Build(ids_in_cluster.size(), cluster_data.data_ptr, paras);
+            } catch (const std::exception& e) {
+                std::cerr << "Error during NSG build for cluster " << cluster_id 
+                          << ": " << e.what() << std::endl;
+                return false;
+            }
 
             // 保存NSG
             if (!saveNSG(index, cluster_id, use_mmap)) {
                 std::cerr << "Failed to save NSG for cluster " << cluster_id << std::endl;
                 return false;
             }
+            
+            std::cout << "Successfully built and saved NSG graph for cluster " << cluster_id << std::endl;
         }
         return true;
     } catch (const std::exception& e) {
@@ -780,6 +869,16 @@ bool IndexBuilder<T>::build_mmap(const std::string& data_file, DataFormat format
     auto cluster_data_duration = std::chrono::duration_cast<std::chrono::milliseconds>(cluster_data_end - cluster_data_start);
     std::cout << "Cluster data build time: " << cluster_data_duration.count() / 1000.0 << " s" << std::endl;
     
+    // 🎯 关键优化：显式提前释放shared mmap资源
+    // 此时构建NNDescent的时候内存不够，而前面的MMAP其实已经可以释放了，后续按照需要再加载
+    std::cout << "Releasing shared memory mapping to free up resources for NNDescent..." << std::endl;
+    shared_mmap_res = MMapResource();  // 清空资源，等效于析构
+    shared_data_ptr = nullptr;  // 确保指针也被清空
+    
+    // 强制内存清理
+    std::cout << "Forcing memory cleanup..." << std::endl;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));  // 给系统一点时间清理
+    
     // 构建NNDescent图
     auto nndescent_start = std::chrono::high_resolution_clock::now();
     
@@ -826,7 +925,7 @@ bool IndexBuilder<T>::build_mmap(const std::string& data_file, DataFormat format
     }
 
     // 删除 NNDescent 图
-    std::filesystem::remove_all(prefix_ + "/nndescent");
+    // std::filesystem::remove_all(prefix_ + "/nndescent");
     
     // 输出时间占比
     double ivf_percent = (double)ivf_duration.count() / total_duration.count() * 100;
@@ -899,12 +998,34 @@ bool IndexBuilder<T>::buildIVFIndex_mmap_shared(const std::string& data_file, Da
         std::cout << "Getting cluster assignments using existing memory mapping..." << std::endl;
         
         // 获取聚类分配（使用内存映射的数据）
+        /*
         std::vector<float> float_data(points_num * dim);
         convert_format_to_float_batch<T>(data_ptr, format, 0, points_num, dim, float_data);
         
         // 获取聚类分配
         cluster_assignments.resize(points_num);
         index_ivf_->quantizer->assign(points_num, float_data.data(), cluster_assignments.data());
+        */
+
+        const size_t assign_batch_size = 100000; // 10万为一批
+        const size_t num_batches = (points_num + assign_batch_size - 1) / assign_batch_size;
+
+        cluster_assignments.resize(points_num);
+
+        // 注意：OpenMP 并行处理每个 batch
+        #pragma omp parallel for schedule(dynamic)
+        for (size_t batch_id = 0; batch_id < num_batches; ++batch_id) {
+            size_t start = batch_id * assign_batch_size;
+            size_t num = std::min(assign_batch_size, points_num - start);
+
+            std::vector<float> float_batch(num * dim);
+            convert_format_to_float_batch<T>(data_ptr, format, start, num, dim, float_batch);
+
+            index_ivf_->quantizer->assign(num, float_batch.data(), cluster_assignments.data() + start);
+
+            #pragma omp critical
+            std::cout << "Assigned " << (start + num) << "/" << points_num << " points to IVF index" << std::endl;
+        }
         
         std::cout << "Successfully built IVF index and got cluster assignments with " << points_num << " points" << std::endl;
         return true;
@@ -918,36 +1039,62 @@ bool IndexBuilder<T>::buildIVFIndex_mmap_shared(const std::string& data_file, Da
 template<typename T>
 bool IndexBuilder<T>::buildClusterData_mmap_shared(const std::string& data_file, DataFormat format, 
                                                   const std::map<faiss::idx_t, std::vector<faiss::idx_t>>& cluster_to_ids,
-                                                  unsigned dim, unsigned points_num, size_t batch_size, const void* shared_data_ptr) {
+                                                  unsigned dim, unsigned points_num,
+                                                  size_t batch_size, const void* shared_data_ptr) {
     try {
-        // 使用传入的共享内存映射，避免重复映射
         const void* data_ptr = shared_data_ptr;
-        
-        for (const auto& [cluster_id, ids_in_cluster] : cluster_to_ids) {
-            std::string cluster_file = prefix_ + "/cluster_data/cluster_" + std::to_string(cluster_id) + ".data";
-            std::ofstream out(cluster_file, std::ios::binary);
-            if (!out.is_open()) {
-                std::cerr << "Cannot open cluster file " << cluster_file << std::endl;
-                return false;
-            }
 
-            // 根据格式转换数据到临时缓冲区
+        std::vector<faiss::idx_t> cluster_ids;
+        for (const auto& [cluster_id, _] : cluster_to_ids) {
+            cluster_ids.push_back(cluster_id);
+        }
+
+        const int max_parallel_clusters = 8;  // 你可以根据内存条件设置
+        std::atomic<int> running_clusters(0); // 控制并发
+
+        #pragma omp parallel for schedule(dynamic, 1)
+        for (int i = 0; i < static_cast<int>(cluster_ids.size()); ++i) {
+            // 控制并发数量
+            while (running_clusters.load() >= max_parallel_clusters) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            running_clusters.fetch_add(1);
+
+            auto cluster_id = cluster_ids[i];
+            const auto& ids_in_cluster = cluster_to_ids.at(cluster_id);
+            std::string cluster_file = prefix_ + "/cluster_data/cluster_" + std::to_string(cluster_id) + ".data";
+
             std::vector<T> temp_data(ids_in_cluster.size() * dim);
             convert_format_to_original_batch<T>(data_ptr, format, ids_in_cluster, dim, temp_data);
-            
-            // 写入转换后的数据
-            out.write((char*)temp_data.data(), temp_data.size() * sizeof(T));
-            
-            // 清理临时数据，释放内存
+
+            std::string temp_file = cluster_file + ".tmp";
+            {
+                std::ofstream out(temp_file, std::ios::binary);
+                if (!out.is_open()) {
+                    #pragma omp critical
+                    std::cerr << "Cannot open temp cluster file " << temp_file << std::endl;
+                    running_clusters.fetch_sub(1);
+                    continue;
+                }
+                out.write((char*)temp_data.data(), temp_data.size() * sizeof(T));
+                out.close();
+            }
+
+            // 重命名为正式文件
+            #pragma omp critical
+            std::filesystem::rename(temp_file, cluster_file);
+
             temp_data.clear();
             temp_data.shrink_to_fit();
-            
-            out.close();
+
+            #pragma omp critical
+            std::cout << "Finished writing cluster " << cluster_id << " data." << std::endl;
+
+            running_clusters.fetch_sub(1);
         }
-        
-        // 不再需要手动释放内存映射，由调用者管理
+
         return true;
-        
+
     } catch (const std::exception& e) {
         std::cerr << "Error building cluster data with mmap: " << e.what() << std::endl;
         return false;

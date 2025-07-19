@@ -131,7 +131,7 @@ void IndexGraph::NNDescent(const Parameters &parameters) {
     update(parameters);
     //checkDup();
     eval_recall(control_points, acc_eval_set);
-    std::cout << "iter: " << it << std::endl;
+    // std::cout << "iter: " << it << std::endl;
   }
 }
 
@@ -168,7 +168,7 @@ void IndexGraph::eval_recall(std::vector<unsigned>& ctrl_points, std::vector<std
     }
     mean_acc += acc / v.size();
   }
-  std::cout<<"recall : "<<mean_acc / ctrl_points.size() <<std::endl;
+  // std::cout<<"recall : "<<mean_acc / ctrl_points.size() <<std::endl;
 }
 
 

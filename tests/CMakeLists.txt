@@ -16,6 +16,7 @@ set(COMMON_LIBS
     ${OpenMP_CXX_FLAGS}
     aux_util
     CNNS
+    stdc++fs
 )
 
 # 添加测试程序
@@ -31,12 +32,15 @@ add_executable(test_index_search test_index_search.cpp)
 add_executable(test_search_mmap test_search_mmap.cpp)
 add_executable(test_search_pread test_search_pread.cpp)
 add_executable(test_search_serial test_search_serial.cpp)
+add_executable(test_nndescent_build test_nndescent_build.cpp)
+add_executable(test_nsg_build test_nsg_build.cpp)
 
 # 链接库
 foreach(TARGET cluster_IVF_nndescent nndescent_nsg cluster_hnsw_nsg_search 
         cluster_hnsw_nsg_search_pipeline cluster_hnsw_nsg_search_add_load_time 
         cluster_hnsw_nsg_search_query cluster_hnsw_nsg_search_mmap 
-        test_index_build test_index_search test_search_mmap test_search_pread test_search_serial)
+        test_index_build test_index_search test_search_mmap test_search_pread test_search_serial
+        test_nndescent_build test_nsg_build)
     target_link_libraries(${TARGET} ${COMMON_LIBS})
 endforeach()
 
